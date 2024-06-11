@@ -3,7 +3,7 @@
 * Each tag will have a placeholder value first before the actual value 
 * to control the substitute flag. Placeholder value are insignificants value
 *
-* Data received: ${tag}, ${timestamp}, ${value}
+* Data received: ${tag}, ${original_timestamp}, ${value}
 @mode edit,t
 @tabl piarc
 @istr tag,time,value,mode
