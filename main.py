@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from string import Template
@@ -23,7 +23,10 @@ else:
     raise FileNotFoundError("config.toml not found")
 
 if CONFIG["verbose"]:
+    logger.info("Verbose mode enabled.")
     VERBOSE = True
+else:
+    VERBOSE = False
 
 
 async def start_process():
@@ -37,16 +40,9 @@ async def start_process():
     if CONFIG["rtu"]["test"]:
         filtered_data = filtered_data[:5]
 
-    for obj in filtered_data:
-        created, config_path = await create_config(
-            obj["Name"], obj["Date"]["Value"], obj["Value"]
-        )
-        if not created:
-            logger.error("Failed to create config file.")
+    tasks = [process_data(obj) for obj in filtered_data]
+    await asyncio.gather(*tasks)
 
-        if CONFIG["piconfig"]["push"]:
-            logger.info("Pushing data to PI...")
-            await run_piconfig(config_path)
     end_time = time.time()
     total_time = end_time - start_time
 
@@ -79,13 +75,36 @@ def collect_forced_data(data) -> List[dict]:
     return result
 
 
+async def process_data(obj):
+
+    value = None
+
+    # To avoid comparing int with float for Binary Input values
+    if obj["Type"] == "AI":
+        value = obj["Value"]
+    elif obj["Type"] == "BI":
+        value = obj["ValueRaw"]
+    else:
+        logger.error("Invalid data type.")
+        return
+
+    created, config_path = await create_config(obj["Name"], obj["Date"]["Value"], value)
+    if not created:
+        logger.error("Failed to create config file.")
+        return
+
+    if CONFIG["piconfig"]["push"]:
+        logger.info("Pushing data to PI...")
+        await run_piconfig(config_path)
+
+
 async def create_config(tag: str, timestamp: str, value: float) -> Tuple[bool, str]:
     template_path = CONFIG["piconfig"]["template"]
     config_path = os.path.join(
         os.getcwd(), CONFIG["piconfig"]["config_folder"], f"{tag}.inp"
     )
-    archive_time = get_archive_time(tag, timestamp, value)
-    original_timestamp, formatted_timestamp = convert_date(archive_time)
+    archive_time = await get_archive_time(tag, timestamp, value)
+    rtu_timestamp, formatted_timestamp = convert_date(archive_time)
     PLACEHOLDER_VALUE = -1
     PLACEHOLDER_MODE = "replace"
     created = False
@@ -102,7 +121,7 @@ async def create_config(tag: str, timestamp: str, value: float) -> Tuple[bool, s
 
     result = src.substitute(
         tag=tag,
-        original_timestamp=original_timestamp,
+        original_timestamp=rtu_timestamp,
         value=value,
         add_data=replace_content,
     )
@@ -119,13 +138,172 @@ async def create_config(tag: str, timestamp: str, value: float) -> Tuple[bool, s
 
 
 async def run_piconfig(config_path):
-    command = subprocess.run(
-        f"piconfig < {config_path}", shell=True, text=True, capture_output=True
+    # command = subprocess.run(
+    #     f"piconfig < {config_path}", shell=True, text=True, capture_output=True
+    # )
+    command = await asyncio.create_subprocess_shell(
+        f"piconfig < {config_path}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    stdout, stderr = await command.communicate()
     if VERBOSE:
-        logger.info(command.stdout)
+        logger.info(stdout.decode())
     if not CONFIG["piconfig"]["export"]:
         os.remove(config_path)
+
+
+async def get_archive_time(tag: str, time: str, value: float):
+    archive_time = None
+    start_time, endtime = generate_timerange(time)
+    get_recorded_link = f"{CONFIG['piserver']['url']}/piwebapi/points?path=\\\\{CONFIG['piserver']['name']}\\{tag}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            get_recorded_link,
+            auth=aiohttp.BasicAuth(
+                CONFIG["piserver"]["username"], CONFIG["piserver"]["password"]
+            ),
+            ssl=False,
+        ) as response:
+            tag_response = await response.json()
+
+        if VERBOSE:
+            logger.info(f"Get recorded URL: {get_recorded_link}")
+            logger.info(f"Tag response: {tag_response}")
+
+        tag_recorded_url = tag_response["Links"]["RecordedData"]
+        fetch_timestamp_url = (
+            f"{tag_recorded_url}?startTime={start_time}&endTime={endtime}"
+        )
+
+        async with session.get(
+            fetch_timestamp_url,
+            auth=aiohttp.BasicAuth(
+                CONFIG["piserver"]["username"], CONFIG["piserver"]["password"]
+            ),
+            ssl=False,
+        ) as response:
+            timestamp_response = await response.json()
+
+        if VERBOSE:
+            logger.info(f"Fetch timestamp URL: {fetch_timestamp_url}")
+            logger.info(f"Timestamp response: {timestamp_response}")
+
+        data = timestamp_response.get("Items", [])
+        if not data:
+            logger.error("No data found.")
+            return start_time
+
+        for item in data:
+            item_value = item.get("Value")
+            if type(item_value) != type(value):
+                logger.warning(
+                    f"Skipping item due to type mismatch: {item_value} (type: {type(item_value)})"
+                )
+                logger.info(
+                    f"Expected value type: {type(value)}({value}), Got value type: {type(item_value)}({item_value})"
+                )
+                continue
+
+            if isinstance(item_value, float) and math.isclose(
+                item_value, value, rel_tol=1e-6
+            ):
+                logger.info("Timestamp found in PIWebAPI. Using the timestamp...")
+                archive_time = item["Timestamp"]
+                if VERBOSE:
+                    logger.info(f"Timestamp: {archive_time}")
+                return archive_time
+            elif isinstance(item_value, (int, float)) and item_value == value:
+                logger.info("Timestamp found in PIWebAPI. Using the timestamp...")
+                archive_time = item["Timestamp"]
+                if VERBOSE:
+                    logger.info(f"Timestamp: {archive_time}")
+                return archive_time
+            else:
+                logger.warning("No timestamp found in PIWebAPI.")
+                logger.warning(f"Value {item_value} is not equal to {value}.")
+                if VERBOSE:
+                    logger.info(f"Timestamp: {archive_time}")
+                archive_time = start_time
+                return archive_time
+
+        if VERBOSE:
+            logger.info(f"Archive time: {archive_time}")
+    return archive_time
+
+
+def old_archive_time(tag: str, time: str, value: float):
+
+    archive_time = None
+
+    start_time, endtime = generate_timerange(time)
+    get_recorded_link = f"{CONFIG['piserver']['url']}/piwebapi/points?path=\\\\{CONFIG['piserver']['name']}\{tag}"
+
+    tag_response = requests.get(
+        get_recorded_link,
+        auth=(CONFIG["piserver"]["username"], CONFIG["piserver"]["password"]),
+        verify=False,
+    ).json()
+
+    if VERBOSE:
+        logger.info(f"Get recorded URL: {get_recorded_link}")
+        logger.info(f"Tag response: {tag_response}")
+
+    tag_recorded_url = tag_response["Links"]["RecordedData"]
+    fetch_timestamp_url = f"{tag_recorded_url}?startTime={start_time}&endTime={endtime}"
+
+    timestamp_response = requests.get(
+        fetch_timestamp_url,
+        auth=(CONFIG["piserver"]["username"], CONFIG["piserver"]["password"]),
+        verify=False,
+    ).json()
+
+    if VERBOSE:
+        logger.info(f"Fetch timestamp URL: {fetch_timestamp_url}")
+        logger.info(f"Timestamp response: {timestamp_response}")
+
+    data = timestamp_response.get("Items", [])
+
+    if not data or len(data) == 0:
+        logger.error("No data found.")
+        return start_time
+
+    for item in data:
+
+        if not type(item["Value"]) == float:
+            logger.error("Value is not a float. Using the start time...")
+            archive_time = start_time
+        # Checks if the value is the same as the lookup value
+        elif math.isclose(item["Value"], value, rel_tol=1e-6):
+            logger.info("Timestamp found in PIWebAPI. Using the timestamp...")
+            archive_time = item["Timestamp"]
+            if VERBOSE:
+                logger.info(f"Timestamp: {archive_time}")
+            return archive_time
+        else:
+            logger.warning("No timestamp found in PIWebAPI.")
+            logger.warning(f"Value {item['Value']} is not equal to {value}.")
+            if VERBOSE:
+                logger.info(f"Timestamp: {archive_time}")
+            archive_time = start_time
+            return archive_time
+
+    if VERBOSE:
+        logger.info(f"Archive time: {archive_time}")
+    return archive_time
+
+
+def generate_timerange(time: str) -> Tuple[str, str]:
+    starttime = time
+
+    original_datetime = datetime.fromisoformat(time[:-1])
+    new_datetime = original_datetime + timedelta(milliseconds=2)
+
+    # Convert the datetime object back to string format
+    endtime = new_datetime.isoformat() + "Z"
+
+    return starttime, endtime
 
 
 def convert_date(date_str: str) -> Tuple[str, str]:
@@ -171,62 +349,6 @@ def convert_date(date_str: str) -> Tuple[str, str]:
         logger.info(f"Formatted date: {formatted_date}")
 
     return date_str, formatted_date
-
-
-def get_archive_time(tag: str, time: str, value: float):
-
-    archive_time = None
-
-    start_time, endtime = generate_timerange(time)
-    get_recorded_link = f"{CONFIG['piserver']['url']}/piwebapi/points?path=\\\\{CONFIG['piserver']['name']}\{tag}"
-
-    tag_response = requests.get(
-        get_recorded_link,
-        auth=(CONFIG["piserver"]["username"], CONFIG["piserver"]["password"]),
-        verify=False,
-    ).json()
-
-    tag_recorded_url = tag_response["Links"]["RecordedData"]
-    fetch_timestamp_url = f"{tag_recorded_url}?startTime={start_time}&endTime={endtime}"
-
-    timestamp_response = requests.get(
-        fetch_timestamp_url,
-        auth=(CONFIG["piserver"]["username"], CONFIG["piserver"]["password"]),
-        verify=False,
-    ).json()
-
-    data = timestamp_response.get("Items", [])
-
-    if not data or len(data) == 0:
-        logger.error("No data found.")
-        return start_time
-
-    for item in data:
-        # Checks if the value is the same as the lookup value
-        if math.isclose(item["Value"], value, rel_tol=1e-6):
-            logger.info("Timestamp found in PIWebAPI. Using the timestamp...")
-            archive_time = item["Timestamp"]
-            break
-        else:
-            logger.warning("No timestamp found in PIWebAPI.")
-            logger.warning(f"Value {item['Value']} is not equal to {value}.")
-            archive_time = start_time
-
-    if VERBOSE:
-        logger.info(f"Archive time: {archive_time}")
-    return archive_time
-
-
-def generate_timerange(time: str) -> Tuple[str, str]:
-    starttime = time
-
-    original_datetime = datetime.fromisoformat(time[:-1])
-    new_datetime = original_datetime + timedelta(milliseconds=2)
-
-    # Convert the datetime object back to string format
-    endtime = new_datetime.isoformat() + "Z"
-
-    return starttime, endtime
 
 
 if __name__ == "__main__":
