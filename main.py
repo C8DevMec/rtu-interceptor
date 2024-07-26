@@ -160,7 +160,7 @@ async def run_piconfig(config_path):
 async def get_archive_time(tag: str, time: str, value: float):
     archive_time = None
     start_time, endtime = generate_timerange(time)
-    get_recorded_link = f"{CONFIG['piserver']['url']}/piwebapi/points?path=\\\\{CONFIG['piserver']['name']}\\{tag}"
+    get_recorded_link = f"{CONFIG['piserver']['url']}/piwebapi/points?path=\\\\{CONFIG['piserver']['name']}\\LSO.1.{tag}"
 
     async with aiohttp.ClientSession() as session:
         async with session.get(
