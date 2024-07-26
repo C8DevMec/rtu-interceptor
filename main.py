@@ -115,7 +115,7 @@ async def create_config(tag: str, timestamp: str, value: float) -> Tuple[bool, s
         src = Template(f.read())
 
     replace_content += (
-        f"{tag},{formatted_timestamp},{PLACEHOLDER_VALUE},{PLACEHOLDER_MODE}\n"
+        f"LSO.1.{tag},{formatted_timestamp},{PLACEHOLDER_VALUE},{PLACEHOLDER_MODE}\n"
     )
     replace_content += f"{tag},{formatted_timestamp},{value},{PLACEHOLDER_MODE}"
 
