@@ -88,7 +88,11 @@ async def process_data(obj):
         logger.error("Invalid data type.")
         return
 
-    created, config_path = await create_config(obj["Name"], obj["Date"]["Value"], value)
+    tag_with_prefix = f"LSO.1.{obj['Name']}"
+
+    created, config_path = await create_config(
+        tag_with_prefix, obj["Date"]["Value"], value
+    )
     if not created:
         logger.error("Failed to create config file.")
         return
@@ -115,7 +119,7 @@ async def create_config(tag: str, timestamp: str, value: float) -> Tuple[bool, s
         src = Template(f.read())
 
     replace_content += (
-        f"LSO.1.{tag},{formatted_timestamp},{PLACEHOLDER_VALUE},{PLACEHOLDER_MODE}\n"
+        f"{tag},{formatted_timestamp},{PLACEHOLDER_VALUE},{PLACEHOLDER_MODE}\n"
     )
     replace_content += f"{tag},{formatted_timestamp},{value},{PLACEHOLDER_MODE}"
 
